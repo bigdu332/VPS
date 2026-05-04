@@ -117,6 +117,13 @@ pattern_answer = r"<answer>.*?</answer>(\s*)$"
 # 两者各出现且仅出现一次 → 1.0，否则 0.0
 ```
 
+**一句话理解**：回答必须以 `<think>` 开始、以 `</answer>` 结束，且中间不能有多余的成对同名标签。
+
+用 `re.findall` 匹配，`len == 1` 才算合格——多一个或少一个都是 0 分：
+- `<think>` 出现两次 → 0（重复）
+- `<answer>` 没有 → 0（缺失）
+- 顺序反了（answer 在 think 前）→ pattern 匹配失败 → 0
+
 ### get_repetition_penalty_reward（第108行）
 ```python
 scaling = 1 - len(unique_40grams) / total_40grams   # 重复率 [0,1]
