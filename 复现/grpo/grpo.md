@@ -18,25 +18,26 @@
 
 ---
 
-## 当前进度（2026-05-03 21:59）
+## 当前进度（2026-05-03 22:19）
 
-- **状态**：第 16 次，8 卡 + batch=128 + micro_batch=2 + max_resp=4096 + **liger-kernel** + **gc.collect + empty_cache 全面补丁**
-- **已验证通过**：fit() ✅、rollout ✅、reward ✅、**compute_log_probs ✅**、**compute_ref_log_probs ✅**、**update_policy 27/64 进行中（无 OOM）**
-- **等待**：Step 1 metrics 输出 + checkpoint 保存
+- **状态**：第 16 次，**训练循环已跑通！** Step 1 完成 + checkpoint 保存 ✅，Step 2 update_policy 进行中
+- **配置**：8 卡 + batch=128 + micro_batch=2 + max_resp=4096 + liger-kernel + gc.collect + empty_cache
+- **checkpoint**：`global_step_1` 已保存
 
 ### 当前 Plan
 
 1. ✅ fit() 进入确认
 2. ✅ rollout 完成
 3. ✅ reward 计算完成
-4. ✅ compute_log_probs 64/64 通过（empty_cache + .cpu() 补丁）
+4. ✅ compute_log_probs 64/64 通过
 5. ✅ compute_ref_log_probs 通过
-6. ⏳ update_policy 17/64 进行中（无 OOM）
-7. ⬜ Step 1 metrics 输出
-8. ⬜ checkpoint 保存确认
-9. ⬜ 恢复完整 curriculum，正式跑 10 episodes
+6. ✅ **update_policy 64/64 通过**
+7. ✅ **Step 1 metrics 输出 + checkpoint 保存（global_step_1）**
+8. ⏳ Step 2 update_policy 5/64 进行中
+9. ⬜ 1 episode 跑完（共 117 steps）
+10. ⬜ 恢复完整 curriculum，正式跑 10 episodes
 
----
+### 训练速度估算
 
 ## 启动命令
 
@@ -238,7 +239,7 @@ i.e., <think> reasoning process here, with potential reflections and corrections
 
 ### 修复 8：compute_log_probs 显存泄漏（OOM 终极解法）
 - **文件**：`verl/workers/actor/dp_actor.py`（第 249 行）
-- **问题**：`compute_log_prob()` 循环内每个 micro batch 的 FSDP all-gather 产生显存碎片逐步累积，log_probs 结果也留在 GPU 上。循环内没有 `empty_cache()`，verl 官方只在 rollout→compute 切换时清一次
+- **问题**：`compute_log_prob()` 循环内每个 micro batch forward 产生 logits 张量（shape: `total_nnz × vocab_size=152,064`，约 3.6 GB），算完 log_probs 后 logits 被 GC 释放进 PyTorch allocator 缓存池但不归还 CUDA，每批累积 ~3.9 GB。循环内没有 `empty_cache()`，verl 官方只在 rollout→compute 切换时清一次
 - **现象**：每处理一个 micro batch 显存泄漏 ~4 GB，13/32 时从 5 GB 涨到 56 GB → OOM
 - **修复**：
   ```python
@@ -315,8 +316,8 @@ i.e., <think> reasoning process here, with potential reflections and corrections
 
 ### 4. FSDP actor + vllm rollout 共享 GPU 显存
 - verl 是 hybrid engine 架构：actor（FSDP 训练）和 rollout（vllm 推理）**交替占用同一组 GPU**
-- rollout 阶段：FSDP actor 权重 offload 到 CPU/sleep，vllm 加载模型做 generate
-- training 阶段：vllm sleep 释放显存，FSDP actor 恢复做 forward/backward
+- rollout 阶段：vllm `sleep()` 把模型权重和 KV cache 释放回 CPU，GPU 让给训练
+- training 阶段：vllm `wake_up()` 重新占用 GPU，FSDP actor 做 forward/backward
 - 如果两者抢占不彻底，显存会叠加导致 OOM
 - 默认 `gpu_memory_utilization=0.75` + cudagraph 占用过多 → rollout 阶段 OOM
 - **解决方案（6 卡时代，显存紧张）**：
@@ -404,8 +405,8 @@ i.e., <think> reasoning process here, with potential reflections and corrections
 
 ### 13. compute_log_probs 循环内显存碎片累积（OOM 终极根因）
 - verl 的 `dp_actor.py` 里 `compute_log_prob()` 循环 N 个 micro batch 做 forward
-- 每次 FSDP forward 会 all-gather 完整参数 → forward → reshard，但 PyTorch CUDA allocator 不会立刻还内存
-- 碎片逐 micro batch 累积（~4 GB/batch），到第 13 个就填满 80 GB
+- 每次 forward 产生 logits 张量（total_nnz × vocab_size=152,064 × bf16 ≈ 3.6 GB），算完 log_probs 后 GC 释放进 PyTorch allocator 缓存池但不归还 CUDA
+- 碎片逐 micro batch 累积（~3.9 GB/batch），到第 13 个就填满 80 GB
 - `expandable_segments` 只解决 segment 粒度的碎片，不解决 allocator pool 的碎片
 - **正解**：循环内加 `log_probs.cpu()` + `torch.cuda.empty_cache()`
 - 这是 verl 官方的遗漏——sharding manager 在 rollout↔training 切换时有 `empty_cache()`，但 micro batch 循环内没有
@@ -423,10 +424,12 @@ i.e., <think> reasoning process here, with potential reflections and corrections
 
 ## 历史运行记录
 
-### 第 16 次（2026-05-03 21:41，当前 ⏳）
+### 第 16 次（2026-05-03 21:41，✅ 训练循环跑通！）
 - 8 卡 + batch=128 + micro_batch=2 + max_resp=4096
 - **liger-kernel 0.5.10** + empty_cache + gc.collect 全面补丁
-- compute_log_probs ✅，update_policy 17/64 进行中，无 OOM
+- compute_log_probs ✅ → ref_log_probs ✅ → update_policy 64/64 ✅ → **checkpoint saved（global_step_1）** 🎉
+- Step 2 继续运行中（update_policy 5/64）
+- 每 step ~40 min，1 episode 117 steps ~77h
 
 ### 第 15 次（2026-05-03 21:37）
 - 同 14 但加了 micro_batch_for_update=2 + update 循环 empty_cache
